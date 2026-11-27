@@ -227,7 +227,6 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
         f"public/queue/{job_id}",
         {
             "status": "running",
-            "done": 0,
             "total": ASSIGNMENT_TOTAL,
             "updatedAt": _now_ms(),
         },
