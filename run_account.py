@@ -16,6 +16,12 @@ import solver
 
 ASSIGNMENTS_HOME = "https://learn.eltngl.com/dashboard/assignments"
 KEYNOTE3_RE = re.compile(r"keynote\s*3|english\s*2|\beng\s*2\b", re.IGNORECASE)
+UNIT_PREFIX_RE = re.compile(r"^\s*(Unit\s+\d+)\b", re.IGNORECASE)
+
+
+def _extract_unit_label(name: str) -> str:
+    m = UNIT_PREFIX_RE.match(str(name or ""))
+    return m.group(1).strip().lower() if m else ""
 
 
 def _validate_ngl_url(url: str) -> str:
@@ -350,6 +356,8 @@ def run_remaining(
     progress_callback=None,
     heartbeat_callback=None,
     target_total_minutes: float = 0.0,
+    max_units: int = 0,
+    max_activities: int = 0,
     persist_session: bool = False,
     quiet_logs: bool = False,
 ) -> dict:
@@ -366,7 +374,7 @@ def run_remaining(
     if progress_callback:
         progress_callback(done_count, total_count)
 
-    todo_keys: list[str] = []
+    candidate_items: list[tuple[str, str]] = []
     for url_idx, (_, rows) in enumerate(rows_by_url):
         for r in rows:
             if (
@@ -374,15 +382,48 @@ def run_remaining(
                 and not is_row_completed(r)
                 and not is_row_attempts_exhausted(r)
             ):
-                todo_keys.append(f"{url_idx}::{r['name']}")
+                candidate_items.append((f"{url_idx}::{r['name']}", r["name"]))
 
-    budgets = _build_activity_budgets(todo_keys, target_total_minutes)
+    selected_keys_list: list[str] = []
+    if max_units and max_units > 0:
+        selected_units: list[str] = []
+        has_unit_labels = any(_extract_unit_label(nm) for _, nm in candidate_items)
+        if has_unit_labels:
+            for key, nm in candidate_items:
+                ulab = _extract_unit_label(nm)
+                if ulab:
+                    if ulab not in selected_units:
+                        if len(selected_units) >= max_units:
+                            continue
+                        selected_units.append(ulab)
+                    selected_keys_list.append(key)
+        else:
+            selected_keys_list = [k for k, _ in candidate_items[: max_units * 10]]
+    else:
+        selected_keys_list = [k for k, _ in candidate_items]
+
+    if max_activities and max_activities > 0:
+        selected_keys_list = selected_keys_list[:max_activities]
+
+    selected_key_set = set(selected_keys_list)
+    is_limited_run = bool((max_units and max_units > 0) or (max_activities and max_activities > 0))
+
+    # Scale pacing duration proportionally so partial runs + remaining runs add up naturally
+    effective_target_minutes = float(target_total_minutes or 0.0)
+    if effective_target_minutes > 0 and total_count > 0 and len(selected_keys_list) < total_count:
+        effective_target_minutes = effective_target_minutes * (len(selected_keys_list) / float(total_count))
+
+    budgets = _build_activity_budgets(selected_keys_list, effective_target_minutes)
+    ran_this_session = 0
 
     for url_idx, (url, rows) in enumerate(rows_by_url):
         rows = load_dashboard_rows(driver, url)
         rows_by_url[url_idx] = (url, rows)
         for row in rows:
             name = row["name"]
+            key = f"{url_idx}::{name}"
+            if key not in selected_key_set:
+                continue
             if filter_text and filter_text not in name:
                 continue
             if is_row_completed(row) or is_row_attempts_exhausted(row):
@@ -391,7 +432,6 @@ def run_remaining(
             if not quiet_logs:
                 print(f"START {name}", flush=True)
             started = time.monotonic()
-            key = f"{url_idx}::{name}"
             activity_budget = max(float(min_activity_seconds or 0), float(budgets.get(key, 0.0)))
 
             for attempt in range(1, 4):
@@ -429,6 +469,7 @@ def run_remaining(
                     if latest:
                         row = latest
 
+            ran_this_session += 1
             if persist_session:
                 save_session(driver, username, folder)
 
@@ -449,14 +490,18 @@ def run_remaining(
 
     completed_count = sum(1 for r in final_rows if is_row_completed(r) or is_row_attempts_exhausted(r))
     full_score_count = sum(1 for r in final_rows if is_row_completed(r))
-    if not filter_text and completed_count < len(final_rows):
+    all_completed = completed_count >= len(final_rows)
+    if not filter_text and not is_limited_run and not all_completed:
         raise RuntimeError(f"Incomplete activities remain ({completed_count}/{len(final_rows)})")
     if progress_callback:
-        progress_callback(len(final_rows), len(final_rows))
+        progress_callback(completed_count, len(final_rows))
     return {
         "total": len(final_rows),
         "completed": completed_count,
         "graded_full_score": full_score_count,
+        "all_completed": all_completed,
+        "partial": not all_completed,
+        "ran_this_session": ran_this_session,
     }
 
 
@@ -469,8 +514,10 @@ def run_for_account(
     on_heartbeat=None,
     min_total_minutes: float = 20.0,
     max_total_minutes: float = 40.0,
+    max_units: int = 0,
+    max_activities: int = 0,
 ) -> dict:
-    """Run all remaining ENG2 activities for one account with guaranteed profile cleanup."""
+    """Run remaining ENG2 activities for one account with guaranteed profile cleanup."""
     folder = session_folder(username)
     driver = None
     try:
@@ -488,6 +535,8 @@ def run_for_account(
             progress_callback=on_progress,
             heartbeat_callback=on_heartbeat,
             target_total_minutes=target_minutes,
+            max_units=max_units,
+            max_activities=max_activities,
             persist_session=False,
             quiet_logs=quiet_logs,
         )
@@ -510,6 +559,18 @@ if __name__ == "__main__":
         default=0,
         help="Minimum wall-clock time per activity, including post-save waiting",
     )
+    parser.add_argument(
+        "--max-units",
+        type=int,
+        default=0,
+        help="Optional limit on number of incomplete units to complete (0 = all)",
+    )
+    parser.add_argument(
+        "--max-activities",
+        type=int,
+        default=0,
+        help="Optional hard limit on number of activities to complete (0 = all)",
+    )
     parser.add_argument("--headed", action="store_true")
     args = parser.parse_args()
 
@@ -524,6 +585,8 @@ if __name__ == "__main__":
             args.username,
             filter_text=args.filter_text,
             min_activity_seconds=args.min_activity_seconds,
+            max_units=max(0, args.max_units),
+            max_activities=max(0, args.max_activities),
             persist_session=True,
             quiet_logs=False,
         )

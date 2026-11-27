@@ -295,6 +295,15 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
         min_minutes, max_minutes = 20.0, 40.0
 
     try:
+        max_units = max(0, min(10, int(ticket.get("maxUnits") or 0)))
+    except (TypeError, ValueError):
+        max_units = 0
+    try:
+        max_activities = max(0, min(200, int(ticket.get("maxActivities") or 0)))
+    except (TypeError, ValueError):
+        max_activities = 0
+
+    try:
         summary = run_for_account(
             username=username,
             password=password,
@@ -304,30 +313,49 @@ def _process_job(db: RTDBClient, private_key: Any, job_id: str, ticket: dict[str
             on_heartbeat=_on_heartbeat,
             min_total_minutes=min_minutes,
             max_total_minutes=max_minutes,
+            max_units=max_units,
+            max_activities=max_activities,
         )
         final_total = max(int(summary.get("total", ASSIGNMENT_TOTAL) or ASSIGNMENT_TOTAL), 1)
+        final_done = min(final_total, max(0, int(summary.get("completed", final_total) or 0)))
+        is_all_done = bool(summary.get("all_completed", final_done >= final_total))
         now = _now_ms()
-        already_completed = db.get(f"private/completed/{user_key}")
-        db.put(
-            f"private/completed/{user_key}",
-            {
-                "completedAt": now,
-                "total": final_total,
-            },
-        )
+
         db.delete(f"private/active/{user_key}")
-        db.patch(
-            f"public/queue/{job_id}",
-            {
-                "status": "completed",
-                "done": final_total,
-                "total": final_total,
-                "updatedAt": now,
-            },
-        )
-        if not already_completed:
-            db.increment_completed_count()
-        print("[worker] Job completed at 100%")
+        if is_all_done:
+            already_completed = db.get(f"private/completed/{user_key}")
+            db.put(
+                f"private/completed/{user_key}",
+                {
+                    "completedAt": now,
+                    "total": final_total,
+                },
+            )
+            db.patch(
+                f"public/queue/{job_id}",
+                {
+                    "status": "completed",
+                    "done": final_total,
+                    "total": final_total,
+                    "partial": False,
+                    "updatedAt": now,
+                },
+            )
+            if not already_completed:
+                db.increment_completed_count()
+            print("[worker] Job completed at 100%")
+        else:
+            db.patch(
+                f"public/queue/{job_id}",
+                {
+                    "status": "completed",
+                    "done": final_done,
+                    "total": final_total,
+                    "partial": True,
+                    "updatedAt": now,
+                },
+            )
+            print(f"[worker] Partial job completed ({final_done}/{final_total})")
     except LoginError:
         db.delete(f"private/active/{user_key}")
         db.patch(
